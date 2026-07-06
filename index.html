@@ -22,6 +22,31 @@
       padding: 48px 24px 36px;
     }
 
+    /* ─── FOND VIDÉO ─────────────────────────────────── */
+    .bg-video {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: -1;
+      pointer-events: none;
+      overflow: hidden;
+    }
+
+    .bg-video video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      opacity: 0.18;
+    }
+
+    .bg-video::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse at center, transparent 30%, #0A0A0A 90%);
+    }
+
     /* ─── HERO ─────────────────────────────────────── */
     .hero {
       flex: 1;
@@ -182,11 +207,16 @@
 </head>
 <body>
 
+  <!-- Fond vidéo -->
+  <div class="bg-video">
+    <video src="assets/animation/fond-site gosh.mp4" autoplay muted loop playsinline></video>
+  </div>
+
   <!-- Hero -->
   <section class="hero">
     <div class="video-wrap">
       <canvas id="logo-canvas"></canvas>
-      <video id="logo-vid" src="assets/images/logo-gosh-anime.mp4" muted playsinline style="display:none"></video>
+      <video id="logo-vid" src="assets/images/logo-gosh-anime.MOV" muted playsinline loop preload="auto" style="display:none"></video>
     </div>
 
     <div class="label">Prépare-toi à rejoindre le club.</div>
@@ -223,27 +253,41 @@
     const vid = document.getElementById('logo-vid');
     const canvas = document.getElementById('logo-canvas');
     const ctx = canvas.getContext('2d');
+    let rafId = null;
 
-    vid.addEventListener('loadedmetadata', () => {
+    function init() {
+      if (!vid.videoWidth) return; // dimensions pas encore connues
       canvas.width  = vid.videoWidth;
       canvas.height = vid.videoHeight;
-      vid.play();
-      draw();
-    });
+      vid.play().catch((e) => console.warn('[logo]', e));
+      if (!rafId) rafId = requestAnimationFrame(draw);
+    }
 
-    // On end: seek to 0 and play again — canvas holds last frame during seek
-    vid.addEventListener('ended', () => {
-      vid.currentTime = 0;
-      vid.play();
-    });
+    // loadeddata garantit readyState >= 2 → videoWidth/videoHeight connus
+    if (vid.readyState >= 2) {
+      init();
+    } else {
+      vid.addEventListener('loadeddata', init, { once: true });
+    }
 
     function draw() {
-      if (!vid.paused && !vid.ended) {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // Pas de clearRect — le canvas garde le dernier frame pendant le seek de loop
+      if (vid.readyState >= 2) {
         ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
       }
-      requestAnimationFrame(draw);
+      rafId = requestAnimationFrame(draw);
     }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+        vid.pause();
+      } else {
+        vid.play().catch(() => {});
+        if (!rafId) rafId = requestAnimationFrame(draw);
+      }
+    });
   </script>
 
 </body>
