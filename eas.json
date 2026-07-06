@@ -1,0 +1,37 @@
+{
+  "cli": {
+    "version": ">= 16.0.0"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "ios": {
+        "simulator": true
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "ios": {
+        "buildConfiguration": "Release"
+      },
+      "env": {
+        "GIPHY_API_KEY": "fkzwSJJN5HXh8CckcVA2jxLi0y0Pyspo"
+      }
+    },
+    "production": {
+      "ios": {
+        "buildConfiguration": "Release"
+      }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "appleId": "tomqns22@gmail.com",
+        "ascAppId": "",
+        "appleTeamId": ""
+      }
+    }
+  }
+}

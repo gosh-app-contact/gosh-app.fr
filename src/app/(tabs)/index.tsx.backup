@@ -1,0 +1,1340 @@
+import React, { useState, useCallback, useLayoutEffect, useEffect, useMemo } from 'react';
+import Button from '../../components/Button';
+import PulsingLoader from '../../components/PulsingLoader';
+import {
+  View, Text, StyleSheet, ScrollView, TouchableOpacity,
+  ActivityIndicator, TextInput, KeyboardAvoidingView, Platform, Modal, Alert, Keyboard,
+} from 'react-native';
+import { Image as ExpoImage } from 'expo-image';
+import { useFocusEffect, useRouter, useNavigation } from 'expo-router';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { useColors, colors, spacing, radius } from '../../constants/theme';
+import { loadState, saveState, addWeightEntry, setStorageUid } from '../../utils/storage';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { AppState, Profile } from '../../types';
+import { calculateCalorieGoal, calculateTDEE, PHASE_LABELS } from '../../utils/calculations';
+import { initHealthKit, watchSteps } from '../../utils/healthKit';
+import { computeSuggestedAdjustment } from '../../utils/stagnation';
+import { sendStagnationNotification, sendStepsAchievedNotification } from '../../utils/notifications';
+import CircularProgress from '../../components/CircularProgress';
+import CalorieArc from '../../components/CalorieArc';
+import SessionDetailModal from '../../components/SessionDetailModal';
+import { loadTrainingState, setTrainingStorageUid } from '../../utils/trainingStorage';
+import { TrainingState, WorkoutSession, MUSCLE_LABELS } from '../../types/training';
+import { loadRepasState, setRepasStorageUid } from '../../utils/repasStorage';
+import { computeNutrition } from '../../types/repas';
+import { Ionicons } from '@expo/vector-icons';
+import { auth, db } from '../../utils/firebase';
+import { getPreloadedData, clearPreloadedData } from '../../utils/preloadCache';
+import { doc, getDoc, onSnapshot, updateDoc, collection, query, where, writeBatch, orderBy, limit } from 'firebase/firestore';
+import { syncTrainingStats } from '../../utils/syncTrainingStats';
+
+function DumbbellIcon({ size = 20 }: { size?: number }) {
+  return <Ionicons name="barbell" size={size} color={colors.accent} />;
+}
+
+function ClockIcon({ size = 13, color = colors.textSecondary }: { size?: number; color?: string }) {
+  return <Ionicons name="time-outline" size={size} color={color} />;
+}
+
+function ScaleIcon({ size = 16, color = colors.accent }: { size?: number; color?: string }) {
+  return <Ionicons name="scale-outline" size={size} color={color} />;
+}
+
+function CheckIcon({ size = 16, color = colors.accent }: { size?: number; color?: string }) {
+  return <Ionicons name="checkmark" size={size} color={color} />;
+}
+
+function BedIcon({ size = 20 }: { size?: number }) {
+  return <Ionicons name="bed-outline" size={size} color={colors.textSecondary} />;
+}
+
+export default function HomeScreen() {
+  const colors = useColors();
+  const router = useRouter();
+  const navigation = useNavigation();
+  const [state, setState] = useState<AppState | null>(null);
+  const [trainingState, setTrainingState] = useState<TrainingState | null>(null);
+  const [headerPhoto, setHeaderPhoto] = useState<string | null>(null);
+  const [headerInitial, setHeaderInitial] = useState('?');
+  const [caloriesConsumed, setCaloriesConsumed] = useState(0);
+  const [detailSession, setDetailSession] = useState<{ session: WorkoutSession; time: string } | null>(null);
+  const [showWeightEdit, setShowWeightEdit] = useState(false);
+  const [editWeightInput, setEditWeightInput] = useState('');
+  const [steps, setSteps] = useState(0);
+  // Si des données sont préchargées pendant l'intro, pas de spinner initial
+  const [loading, setLoading] = useState(() => getPreloadedData() === null);
+  const [weightInput, setWeightInput] = useState('');
+  const [savingWeight, setSavingWeight] = useState(false);
+  const [trainingStreak, setTrainingStreak] = useState(0);
+  const [accountType, setAccountType] = useState<'standard' | 'coach' | 'student' | 'admin'>('standard');
+  const [featuredClub, setFeaturedClub] = useState<any>(null);
+  const [myClubId, setMyClubId] = useState<string | null>(null);
+  const [clubNotifCount, setClubNotifCount] = useState(0);
+  const [standardCoachStatus, setStandardCoachStatus] = useState<'none' | 'pending' | 'accepted' | null>(null);
+  const [standardCoachName, setStandardCoachName] = useState<string | null>(null);
+  const [coachSchedule, setCoachSchedule] = useState<import('../../utils/coachStorage').CoachScheduleItem[]>([]);
+  const [showManualModal, setShowManualModal] = useState(false);
+  const [manualLabel, setManualLabel] = useState('');
+  const [manualTime, setManualTime] = useState('09:00');
+  const [manualDay, setManualDay] = useState(0);
+  const [manualLocation, setManualLocation] = useState('');
+  const [manualStudentUid, setManualStudentUid] = useState<string | null>(null);
+  const [studentSearch, setStudentSearch] = useState('');
+  const [coachStudentsList, setCoachStudentsList] = useState<{ uid: string; pseudo: string; photoUrl?: string }[]>([]);
+  const [sessionDetail, setSessionDetail] = useState<import('../../utils/coachStorage').CoachScheduleItem | null>(null);
+  const [savingManual, setSavingManual] = useState(false);
+  const [showTimePicker, setShowTimePicker] = useState(false);
+  const [tempTime, setTempTime] = useState('09:00');
+  const [editingManualId, setEditingManualId] = useState<string | null>(null);
+  const [planUpdated, setPlanUpdated] = useState(false);
+  const _jsDay = new Date().getDay();
+  const todayIdx = _jsDay === 0 ? 6 : _jsDay - 1;
+  const [selectedDayIdx, setSelectedDayIdx] = useState(todayIdx);
+
+  // Écoute le streak + coachStatus en temps réel — uniquement pour les comptes non-coach
+  useEffect(() => {
+    let unsubSnap: (() => void) | null = null;
+    const unsubAuth = auth.onAuthStateChanged(async (user) => {
+      unsubSnap?.();
+      unsubSnap = null;
+      if (!user) return;
+      const { getMyAccountType } = await import('../../utils/coachStorage');
+      const type = await getMyAccountType();
+      if (type === 'coach') return;
+      unsubSnap = onSnapshot(doc(db, 'users', user.uid), async (snap) => {
+        const data = snap.data();
+        setTrainingStreak(data?.trainingStats?.streak ?? 0);
+        if (type === 'standard') {
+          const status = data?.coachStatus ?? null;
+          setStandardCoachStatus(status === 'pending' ? 'pending' : status === 'accepted' ? 'accepted' : 'none');
+          if (status === 'pending' && data?.coachUid) {
+            try {
+              const { getDoc: fgetDoc, doc: fdoc } = await import('firebase/firestore');
+              const { db: fdb } = await import('../../utils/firebase');
+              const coachSnap = await fgetDoc(fdoc(fdb, 'users', data.coachUid));
+              setStandardCoachName(coachSnap.data()?.prenom ?? coachSnap.data()?.pseudo ?? null);
+            } catch { setStandardCoachName(null); }
+          } else {
+            setStandardCoachName(null);
+          }
+        }
+      });
+    });
+    return () => { unsubAuth(); unsubSnap?.(); };
+  }, []);
+
+  // Badge "mise à jour du plan" pour les élèves
+  useEffect(() => {
+    const uid = auth.currentUser?.uid;
+    if (!uid || accountType !== 'student') return;
+    const q = query(
+      collection(db, 'notifications', uid, 'items'),
+      where('type', '==', 'training_plan_updated'),
+      where('read', '==', false),
+    );
+    const unsub = onSnapshot(q, (snap) => setPlanUpdated(!snap.empty));
+    return unsub;
+  }, [accountType]);
+
+  useEffect(() => {
+    if (accountType !== 'standard' && accountType !== 'admin') return;
+    const uid = auth.currentUser?.uid;
+
+    // Featured club en temps réel via onSnapshot
+    const qFeatured = query(collection(db, 'clubs'), orderBy('memberCount', 'desc'), limit(1));
+    const unsubFeatured = onSnapshot(qFeatured, (snap) => {
+      if (!snap.empty) setFeaturedClub({ id: snap.docs[0].id, ...snap.docs[0].data() });
+      else setFeaturedClub(null);
+    }, () => {});
+
+    if (!uid) return unsubFeatured;
+
+    // Check if user is in a club
+    const q2 = query(collection(db, 'clubs'), where('memberIds', 'array-contains', uid));
+    import('firebase/firestore').then(({ getDocs: gd }) => {
+      gd(q2).then((snap) => { if (!snap.empty) setMyClubId(snap.docs[0].id); }).catch(() => {});
+    });
+
+    return unsubFeatured;
+  }, [accountType]);
+
+  useEffect(() => {
+    if (!myClubId || (accountType !== 'standard' && accountType !== 'admin')) return;
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
+    // Club notif count — requires composite index on notifications subcollection
+    let unsub: (() => void) | undefined;
+    try {
+      const q2 = query(
+        collection(db, 'clubs', myClubId, 'notifications'),
+        where('toUid', '==', uid),
+        where('read', '==', false),
+      );
+      unsub = onSnapshot(q2, (snap) => setClubNotifCount(snap.size), () => {});
+    } catch {}
+    return () => unsub?.();
+  }, [myClubId, accountType]);
+
+  const markPlanUpdatedRead = async () => {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
+    try {
+      const q = query(
+        collection(db, 'notifications', uid, 'items'),
+        where('type', '==', 'training_plan_updated'),
+        where('read', '==', false),
+      );
+      const { getDocs } = await import('firebase/firestore');
+      const snap = await getDocs(q);
+      if (snap.empty) return;
+      const batch = writeBatch(db);
+      snap.docs.forEach((d) => batch.update(d.ref, { read: true }));
+      await batch.commit();
+      setPlanUpdated(false);
+    } catch {}
+  };
+
+  const load = useCallback(async () => {
+    try {
+    // Garantit que les 3 UIDs sont set avant tout accès storage (race condition auth → /(tabs))
+    const currentUid = auth.currentUser?.uid ?? null;
+    setStorageUid(currentUid);
+    setTrainingStorageUid(currentUid);
+    setRepasStorageUid(currentUid);
+    const preloaded = getPreloadedData();
+    if (preloaded) {
+      // Première ouverture : données précachées pendant l'intro → 0 spinner
+      setState(preloaded.state);
+      setTrainingState(preloaded.trainingState);
+      setCaloriesConsumed(preloaded.caloriesConsumed);
+      const p = preloaded.activeProfile;
+      if (p) { setHeaderPhoto(p.photo ?? null); setHeaderInitial(p.name?.[0]?.toUpperCase() ?? '?'); }
+      clearPreloadedData();
+      // Charger accountType + planning coach même sur le chemin preloaded
+      const { getMyAccountType, loadCoachWeekSchedule } = await import('../../utils/coachStorage');
+      const type = await getMyAccountType();
+      setAccountType(type);
+      const uid2 = auth.currentUser?.uid;
+      if (type === 'coach' && uid2) {
+        loadCoachWeekSchedule(uid2).then(setCoachSchedule).catch(() => {});
+        const { getDocs, collection: col } = await import('firebase/firestore');
+        const { db: fdb } = await import('../../utils/firebase');
+        getDocs(col(fdb, 'coachStudents', uid2, 'students')).then((snap) => {
+          setCoachStudentsList(snap.docs.map((d) => ({ uid: d.id, pseudo: (d.data() as any).pseudo, photoUrl: (d.data() as any).photoUrl })));
+        }).catch(() => {});
+      }
+      setLoading(false);
+      initHealthKit().catch(() => {});
+    } else {
+      // Revisites ou premier chargement post-onboarding (ou changement de compte)
+      let s = await loadState();
+      console.log('[home] loadState:', s ? `ok profiles:${s.profiles?.length}` : 'null', '| uid:', auth.currentUser?.uid ?? 'null');
+      if (!s) {
+        // Pas de state local → reconstruction depuis Firestore (changement de compte / nouvel appareil)
+        const uid2 = auth.currentUser?.uid;
+        if (uid2) {
+          try {
+            const { doc: fsDoc, getDoc: fsGet } = await import('firebase/firestore');
+            const { db: fdb } = await import('../../utils/firebase');
+            const snap = await fsGet(fsDoc(fdb, 'users', uid2));
+            const udata = snap.data() ?? {};
+            if (udata.onboardingComplete === true) {
+              const { createInitialState, saveState: ss } = await import('../../utils/storage');
+              s = createInitialState(
+                udata.pseudo ?? udata.prenom ?? '',
+                udata.age ?? 25,
+                udata.sex ?? 'male',
+                udata.height ?? 175,
+                udata.weight ?? 75,
+                udata.activityLevel ?? 'moderate',
+                udata.phase ?? 'maintenance',
+              );
+              s.onboardingComplete = true;
+              await ss(s);
+            }
+          } catch {}
+        }
+        if (!s) { setLoading(false); return; }  // Pas de données → écran vide (pas de redirect)
+      }
+      setState(s);
+      const p = s.profiles.find((x: any) => x.id === s.activeProfileId);
+      if (p) {
+        setHeaderPhoto(p.photo ?? null);
+        setHeaderInitial(p.name?.[0]?.toUpperCase() ?? '?');
+        // Sync profil physique vers Firestore pour que le coach puisse le lire
+        const uid = auth.currentUser?.uid;
+        if (uid && p.height && p.weight && p.age && p.sex) {
+          const { doc: fsDoc, updateDoc: fsUpdate } = await import('firebase/firestore');
+          const { db: fdb } = await import('../../utils/firebase');
+          fsUpdate(fsDoc(fdb, 'users', uid), {
+            height: p.height,
+            weight: p.weight,
+            age: p.age,
+            sex: p.sex,
+            activityLevel: p.activityLevel ?? 'moderate',
+            phase: p.phase ?? 'maintenance',
+            birthdate: p.birthdate ?? null,
+            calorieGoalManual: p.calorieGoalManual ?? false,
+            calorieGoal: p.calorieGoal ?? null,
+          }).catch(() => {});
+        }
+      }
+      const { getMyAccountType, loadStudentTrainingPlan, loadCoachWeekSchedule } = await import('../../utils/coachStorage');
+      const accountType = await getMyAccountType();
+      setAccountType(accountType);
+      const uid = auth.currentUser?.uid;
+      const [t, rs] = await Promise.all([
+        accountType === 'student' && uid
+          ? loadStudentTrainingPlan(uid)
+          : loadTrainingState(s.activeProfileId),
+        loadRepasState(s.activeProfileId),
+      ]);
+      if (accountType === 'coach' && uid) {
+        loadCoachWeekSchedule(uid).then(setCoachSchedule).catch(() => {});
+        const { getDocs, collection: col } = await import('firebase/firestore');
+        const { db: fdb } = await import('../../utils/firebase');
+        getDocs(col(fdb, 'coachStudents', uid, 'students')).then((snap) => {
+          setCoachStudentsList(snap.docs.map((d) => ({ uid: d.id, pseudo: (d.data() as any).pseudo, photoUrl: (d.data() as any).photoUrl })));
+        }).catch(() => {});
+      }
+      setTrainingState(t);
+      const today = new Date().toISOString().split('T')[0];
+      const consumed = rs.entries
+        .filter((e) => e.date === today)
+        .reduce((sum, e) => sum + computeNutrition(e.product, e.quantity).kcal, 0);
+      setCaloriesConsumed(Math.round(consumed));
+      setLoading(false);
+    }
+    } catch (e: any) {
+      console.error('[home] load error:', e?.message ?? e);
+      setLoading(false);
+    }
+  }, []);
+
+  useFocusEffect(useCallback(() => {
+    load();
+    const unsubSteps = watchSteps(setSteps);
+    return unsubSteps;
+  }, [load]));
+
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <TouchableOpacity onPress={() => (router as any).push('/profil-modal')} style={{ marginRight: spacing.md }} activeOpacity={0.8}>
+          {headerPhoto ? (
+            <ExpoImage source={{ uri: headerPhoto }} style={{ width: 36, height: 36, borderRadius: 18, borderWidth: 2, borderColor: colors.accent }} contentFit="cover" cachePolicy="memory-disk" />
+          ) : (
+            <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: colors.surface, borderWidth: 2, borderColor: colors.accent, alignItems: 'center', justifyContent: 'center' }}>
+              <Text style={{ color: colors.accent, fontSize: 15, fontWeight: '800' }}>{headerInitial}</Text>
+            </View>
+          )}
+        </TouchableOpacity>
+      ),
+    });
+  }, [headerPhoto, headerInitial, navigation]);
+
+  const activeProfile = state?.profiles.find((p) => p.id === state.activeProfileId);
+
+  const todayStr = new Date().toISOString().split('T')[0];
+  const todayEntry = activeProfile?.weightHistory?.find((w) => w.date === todayStr);
+
+  // Dernier poids enregistré (aujourd'hui ou antérieur)
+  const lastWeightEntry = activeProfile?.weightHistory
+    ?.slice()
+    .sort((a, b) => (a.date > b.date ? -1 : 1))[0] ?? null;
+  const displayWeight = todayEntry ?? lastWeightEntry;
+
+  const updateActiveProfile = (partial: Partial<typeof activeProfile>) => {
+    if (!state || !activeProfile) return state!;
+    const updated = { ...activeProfile, ...partial };
+    return { ...state, profiles: state.profiles.map((p) => p.id === updated.id ? updated : p) };
+  };
+
+  const saveWeight = async () => {
+    const val = parseFloat(weightInput.replace(',', '.'));
+    if (!state || !activeProfile || isNaN(val) || val < 20 || val > 300) return;
+    setSavingWeight(true);
+    try {
+      const withWeight = await addWeightEntry(state, { date: todayStr, weight: val });
+      const next = {
+        ...withWeight,
+        profiles: withWeight.profiles.map((p) =>
+          p.id === withWeight.activeProfileId ? { ...p, weight: val } : p
+        ),
+      };
+      const adj = computeSuggestedAdjustment(next);
+      const profile = next.profiles.find((p) => p.id === next.activeProfileId);
+      if (adj !== null && !profile?.pendingAdjustment && profile) {
+        const suggested = calculateCalorieGoal(profile) + adj;
+        const updatedProfile = { ...profile, pendingAdjustment: { suggestedCalories: suggested, detectedAt: new Date().toISOString() } };
+        const withPending = { ...next, profiles: next.profiles.map((p) => p.id === updatedProfile.id ? updatedProfile : p) };
+        await saveState(withPending);
+        setState(withPending);
+        if (profile.notificationsEnabled.stagnation) sendStagnationNotification(suggested, adj);
+      } else {
+        await saveState(next);
+        setState(next);
+      }
+      const uid = auth.currentUser?.uid;
+      if (uid && accountType === 'student') {
+        updateDoc(doc(db, 'users', uid), { weight: val }).catch(() => {});
+      }
+      setWeightInput('');
+    } catch { Alert.alert('Erreur', 'Impossible d\'enregistrer le poids.'); }
+    finally { setSavingWeight(false); }
+  };
+
+  const confirmAdjustment = async () => {
+    if (!state || !activeProfile || !activeProfile.pendingAdjustment) return;
+    const updated = {
+      ...activeProfile,
+      calorieGoal: activeProfile.pendingAdjustment.suggestedCalories,
+      calorieGoalManual: true,
+      pendingAdjustment: null,
+      lastAdjustmentDate: todayStr,
+      calorieHistory: [...(activeProfile.calorieHistory ?? []), {
+        date: todayStr,
+        oldCalories: calculateCalorieGoal(activeProfile),
+        newCalories: activeProfile.pendingAdjustment.suggestedCalories,
+        reason: 'Stagnation 72h',
+      }],
+    };
+    const next = { ...state, profiles: state.profiles.map((p) => p.id === updated.id ? updated : p) };
+    await saveState(next);
+    setState(next);
+  };
+
+  const refuseAdjustment = async () => {
+    if (!state || !activeProfile) return;
+    const updated = { ...activeProfile, pendingAdjustment: null, lastAdjustmentDate: todayStr };
+    const next = { ...state, profiles: state.profiles.map((p) => p.id === updated.id ? updated : p) };
+    await saveState(next);
+    setState(next);
+  };
+
+  React.useEffect(() => {
+    if (!activeProfile || steps === 0) return;
+    if (steps >= activeProfile.stepGoal && activeProfile.notificationsEnabled.steps) {
+      const today = new Date().toISOString().slice(0, 10);
+      const key = `steps_notif_sent_${today}`;
+      AsyncStorage.getItem(key).then((val) => {
+        if (!val) {
+          sendStepsAchievedNotification(steps);
+          AsyncStorage.setItem(key, '1');
+        }
+      });
+    }
+  }, [steps]);
+
+  const styles = useMemo(() => StyleSheet.create({
+    screen: { flex: 1, backgroundColor: colors.bg },
+    content: { padding: spacing.md, gap: spacing.md, paddingBottom: 160 },
+    greetingRow: { flexDirection: 'row' as const, alignItems: 'center' as const, justifyContent: 'space-between' as const, flexWrap: 'wrap' as const, gap: spacing.xs },
+    dateLabel: { color: colors.textSecondary, fontSize: 12, marginTop: 2, textTransform: 'capitalize' as const },
+    greeting: { color: colors.textSecondary, fontSize: 16 },
+    objectifBadge: { backgroundColor: colors.accent + '22', borderRadius: radius.full, paddingHorizontal: spacing.sm, paddingVertical: 3, borderWidth: 1, borderColor: colors.accent },
+    objectifText: { color: colors.accent, fontSize: 11, fontWeight: '700' as const },
+    bubblesCard: { backgroundColor: colors.card, borderRadius: radius.md, padding: spacing.md, gap: spacing.sm },
+    bubblesLabel: { color: colors.textSecondary, fontSize: 12, fontWeight: '600' as const },
+    bubblesRow: { flexDirection: 'row' as const, alignItems: 'center' as const, gap: spacing.sm },
+    bubble: { width: 36, height: 36, borderRadius: 18, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, alignItems: 'center' as const, justifyContent: 'center' as const },
+    bubbleFilled: { backgroundColor: colors.accentGreen, borderColor: colors.accentGreen },
+    bubbleCheck: { color: colors.text, fontSize: 16, fontWeight: '800' as const },
+    bubblesCycle: { color: colors.textSecondary, fontSize: 11, marginLeft: spacing.xs },
+    streakCard: { backgroundColor: '#1A0A00', borderRadius: radius.md, padding: spacing.md, flexDirection: 'row' as const, alignItems: 'center' as const, gap: spacing.md, borderWidth: 1, borderColor: '#FF6B35AA' },
+    streakCardOff: { backgroundColor: colors.card, borderColor: colors.border },
+    streakFlame: { fontSize: 36 },
+    streakValue: { color: colors.text, fontSize: 16, fontWeight: '800' as const },
+    streakSub: { color: colors.textSecondary, fontSize: 12, marginTop: 2, lineHeight: 17 },
+    trainingCountBadge: { backgroundColor: colors.accentGreen + '22', borderRadius: radius.full, paddingHorizontal: spacing.sm, paddingVertical: 3 },
+    trainingCountText: { color: colors.accentGreen, fontSize: 11, fontWeight: '700' as const },
+    arcCard: { backgroundColor: colors.card, borderRadius: radius.md, paddingVertical: spacing.lg, paddingBottom: spacing.md, alignItems: 'center' as const, gap: spacing.xs },
+    alertCard: {
+      backgroundColor: '#1A120A', borderRadius: radius.md, padding: spacing.md,
+      borderWidth: 1, borderColor: colors.accent,
+    },
+    alertTitle: { color: colors.accent, fontSize: 15, fontWeight: '700' as const, marginBottom: spacing.sm },
+    alertBody: { color: colors.text, fontSize: 14, lineHeight: 20 },
+    alertHighlight: { color: colors.accent, fontWeight: '700' as const },
+    alertButtons: { flexDirection: 'row' as const, gap: spacing.sm, marginTop: spacing.md },
+    alertBtn: { flex: 1, padding: spacing.sm, borderRadius: radius.sm, alignItems: 'center' as const },
+    alertBtnConfirm: { backgroundColor: colors.accent },
+    alertBtnRefuse: { backgroundColor: colors.card },
+    alertBtnText: { color: colors.text, fontWeight: '600' as const, fontSize: 14 },
+    calorieCard: { backgroundColor: colors.card, borderRadius: radius.lg, padding: spacing.xl, alignItems: 'center' as const },
+    calorieLabel: { color: colors.textSecondary, fontSize: 13, fontWeight: '500' as const, marginBottom: spacing.sm },
+    calorieValue: { color: colors.accent, fontSize: 72, fontWeight: '800' as const, lineHeight: 80 },
+    calorieUnit: { color: colors.textSecondary, fontSize: 18, fontWeight: '600' as const },
+    tdeeNote: { color: colors.textSecondary, fontSize: 12, marginTop: spacing.sm },
+    row: { flexDirection: 'row' as const, gap: spacing.md },
+    card: { backgroundColor: colors.card, borderRadius: radius.md, padding: spacing.md, gap: spacing.sm },
+    cardTitle: { color: colors.textSecondary, fontSize: 12, fontWeight: '600' as const, textTransform: 'uppercase' as const, letterSpacing: 1 },
+    cardSub: { color: colors.textSecondary, fontSize: 12, marginTop: spacing.xs },
+    weightValue: { color: colors.text, fontSize: 48, fontWeight: '800' as const },
+    weightUnit: { color: colors.textSecondary, fontSize: 16 },
+    noData: { color: colors.textSecondary, fontSize: 40, fontWeight: '300' as const },
+    editLink: { backgroundColor: colors.accent, paddingVertical: 10, borderRadius: radius.sm, marginTop: spacing.sm, alignSelf: 'stretch' as const, alignItems: 'center' as const },
+    editLinkText: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' as const },
+    editModalOverlay: { flex: 1, backgroundColor: '#000000BB', justifyContent: 'center' as const, alignItems: 'center' as const, padding: spacing.xl },
+    editModalCard: { backgroundColor: colors.card, borderRadius: radius.lg, padding: spacing.xl, width: '100%', gap: spacing.md },
+    editModalTitle: { color: colors.text, fontSize: 17, fontWeight: '800' as const, textAlign: 'center' as const },
+    editModalSub: { color: colors.textSecondary, fontSize: 12, textAlign: 'center' as const },
+    editModalInput: { backgroundColor: colors.surface, borderRadius: radius.sm, borderWidth: 1, borderColor: colors.accent, paddingHorizontal: spacing.lg, paddingVertical: spacing.sm, color: colors.text, fontSize: 28, fontWeight: '800' as const, textAlign: 'center' as const, minWidth: 120 },
+    editModalBtnPrimary: { flex: 1, backgroundColor: colors.accent, borderRadius: radius.sm, padding: spacing.md, alignItems: 'center' as const },
+    editModalBtnSecondary: { flex: 1, backgroundColor: colors.surface, borderRadius: radius.sm, padding: spacing.md, alignItems: 'center' as const, borderWidth: 1, borderColor: colors.border },
+    weightInputCardDone: { opacity: 0.6, backgroundColor: colors.surface },
+    weightInputDisabled: { color: colors.textSecondary, backgroundColor: colors.border + '55' },
+    weightInputCard: { backgroundColor: colors.card, borderRadius: radius.md, padding: spacing.md, gap: spacing.sm },
+    weightInputTitle: { color: colors.text, fontSize: 14, fontWeight: '600' as const },
+    weightInputRow: { flexDirection: 'row' as const, alignItems: 'center' as const, gap: spacing.sm },
+    weightInput: { flex: 1, backgroundColor: colors.surface, borderRadius: radius.sm, paddingHorizontal: spacing.md, paddingVertical: spacing.sm, color: colors.text, fontSize: 18, borderWidth: 1, borderColor: colors.border },
+    weightInputUnit: { color: colors.textSecondary, fontSize: 14 },
+    weightSaveBtn: { backgroundColor: colors.accent, borderRadius: radius.sm, paddingHorizontal: spacing.md, paddingVertical: spacing.sm },
+    weightSaveBtnText: { color: colors.text, fontWeight: '700' as const, fontSize: 14 },
+    trainingCard: { backgroundColor: colors.card, borderRadius: radius.md, padding: spacing.md, gap: spacing.sm, borderWidth: 1, borderColor: colors.border, shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } },
+    trainingTitle: { color: colors.text, fontSize: 14, fontWeight: '700' as const },
+    restText: { color: colors.textSecondary, fontSize: 14, fontStyle: 'italic' as const },
+    trainingItem: { backgroundColor: colors.bg, borderRadius: radius.sm, paddingVertical: 14, paddingHorizontal: spacing.md, flexDirection: 'row' as const, alignItems: 'center' as const, gap: spacing.sm, borderLeftWidth: 3, borderLeftColor: colors.accent },
+    trainingItemDone: { borderLeftColor: colors.accentGreen, opacity: 0.7 },
+    trainingName: { color: colors.text, fontSize: 14, fontWeight: '700' as const },
+    trainingMuscles: { color: colors.textSecondary, fontSize: 12 },
+    trainingTime: { color: colors.textSecondary, fontSize: 11, marginTop: 2 },
+    trainingDoneBadge: { color: colors.accentGreen, fontSize: 12, fontWeight: '700' as const },
+    trainingPending: { color: colors.accent, fontSize: 12, fontWeight: '600' as const },
+  }), [colors]);
+
+  if (loading || !state || !activeProfile) {
+    return (
+      <View style={[styles.screen, { alignItems: 'center', justifyContent: 'center' }]}>
+        <PulsingLoader size={52} />
+      </View>
+    );
+  }
+
+  const calorieGoal = calculateCalorieGoal(activeProfile);
+  const stepProgress = Math.min(1, steps / activeProfile.stepGoal);
+
+  const streak = trainingStreak;
+
+  // Bulles caloriques — jours depuis le dernier changement calorique
+  const daysAtCurrentCalories = (() => {
+    const history = activeProfile?.calorieHistory ?? [];
+    if (history.length === 0) return 0;
+    const lastChange = history[history.length - 1];
+    const diffMs = new Date(todayStr).getTime() - new Date(lastChange.date).getTime();
+    return Math.max(0, Math.floor(diffMs / 86400000));
+  })();
+  const calorieBubbleFilled = daysAtCurrentCalories % 5 || (daysAtCurrentCalories > 0 && daysAtCurrentCalories % 5 === 0 ? 5 : 0);
+  const showCalorieBubbles = (activeProfile?.calorieHistory ?? []).length > 0;
+
+  // Compteur training semaine
+  const weekTrainingCount = (() => {
+    if (!trainingState) return { done: 0, total: 0 };
+    const total = trainingState.schedule.length;
+    const done = trainingState.schedule.filter((s) => s.completed).length;
+    return { done, total };
+  })();
+
+  // Training du jour (0=Lundi … 6=Dimanche, JS getDay 0=Dim donc on ajuste)
+  const jsDay = new Date().getDay(); // 0=Sun
+  const todayDayOfWeek = jsDay === 0 ? 6 : jsDay - 1;
+  const todaySessions = trainingState
+    ? trainingState.schedule
+        .filter((s) => s.dayOfWeek === todayDayOfWeek)
+        .map((s) => ({
+          scheduled: s,
+          session: trainingState.sessions.find((ws) => ws.id === s.sessionId),
+        }))
+        .filter((x) => x.session)
+    : [];
+  const isRestDay = trainingState
+    ? (trainingState.restDays ?? []).includes(todayDayOfWeek)
+    : false;
+
+  return (
+    <SafeAreaView style={styles.screen} edges={[]}>
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
+        <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+          <View style={styles.greetingRow}>
+            <View>
+              <Text style={styles.greeting}>Bonjour, {activeProfile.name}</Text>
+              <Text style={styles.dateLabel}>
+                {new Date().toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' })}
+              </Text>
+            </View>
+            <View style={styles.objectifBadge}>
+              <Text style={styles.objectifText}>{PHASE_LABELS[activeProfile.phase]}</Text>
+            </View>
+          </View>
+
+          {/* Alerte ajustement */}
+          {activeProfile.pendingAdjustment && (
+            <View style={styles.alertCard}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                <Ionicons name="stats-chart-outline" size={16} color={colors.accent} />
+                <Text style={styles.alertTitle}>Ajustement suggéré</Text>
+              </View>
+              <Text style={styles.alertBody}>
+                Stagnation détectée depuis 5 jours. Nouvel objectif :{' '}
+                <Text style={styles.alertHighlight}>{activeProfile.pendingAdjustment!.suggestedCalories} kcal</Text>
+              </Text>
+              <View style={styles.alertButtons}>
+                <Button label="Confirmer" variant="primary" size="sm" style={{ flex: 1 }} onPress={confirmAdjustment} />
+                <Button label="Refuser" variant="ghost" size="sm" style={{ flex: 1 }} onPress={refuseAdjustment} />
+              </View>
+            </View>
+          )}
+
+          {/* Arc calories — objectif + consommé fusionnés */}
+          <View style={styles.arcCard}>
+            <TouchableOpacity
+              onPress={() => Alert.alert('Information', 'Les apports caloriques affichés sont indicatifs et calculés sur la base des données que tu as renseignées. Ils ne remplacent pas l\'avis d\'un professionnel de santé ou d\'un nutritionniste.', [{ text: 'OK' }])}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              style={{ position: 'absolute', top: 10, right: 10, zIndex: 10 }}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="information-circle-outline" size={18} color={colors.textSecondary} />
+            </TouchableOpacity>
+            <CalorieArc consumed={caloriesConsumed} goal={calorieGoal} size={220} />
+            <Text style={styles.tdeeNote}>TDEE : {calculateTDEE(activeProfile)} kcal</Text>
+          </View>
+
+          {/* Bulles — jours consécutifs à cette cible calorique */}
+          {showCalorieBubbles && (
+            <View style={styles.bubblesCard}>
+              <Text style={styles.bubblesLabel}>
+                Jours à {calorieGoal} kcal : {daysAtCurrentCalories}j
+              </Text>
+              <View style={styles.bubblesRow}>
+                {[0, 1, 2, 3, 4].map((i) => {
+                  const filled = i < calorieBubbleFilled;
+                  return (
+                    <View key={i} style={[styles.bubble, filled && styles.bubbleFilled]}>
+                      {filled && <Ionicons name="checkmark" size={10} color={colors.text} />}
+                    </View>
+                  );
+                })}
+                <Text style={styles.bubblesCycle}>
+                  {daysAtCurrentCalories > 0 ? `Cycle ${Math.floor(daysAtCurrentCalories / 5) + 1}` : ''}
+                </Text>
+              </View>
+            </View>
+          )}
+
+          {/* Streak entraînement — masqué pour les coachs */}
+          {accountType !== 'coach' && <View style={[styles.streakCard, streak === 0 && styles.streakCardOff]}>
+            <Ionicons name={streak === 0 ? 'heart-outline' : 'flame'} size={24} color={streak === 0 ? colors.textSecondary : colors.accent} />
+            <View style={{ flex: 1 }}>
+              {streak === 0 ? (
+                <>
+                  <Text style={styles.streakValue}>Pas encore de streak</Text>
+                  <Text style={styles.streakSub}>Valide une semaine complète pour allumer la flamme et maintiens-la en t'entraînant régulièrement !</Text>
+                </>
+              ) : (
+                <>
+                  <Text style={styles.streakValue}>{streak} semaine{streak > 1 ? 's' : ''} de streak</Text>
+                  <Text style={styles.streakSub}>Continue à t'entraîner pour maintenir ta série !</Text>
+                </>
+              )}
+            </View>
+          </View>}
+
+          {/* Box coaching — comptes standard uniquement */}
+          {accountType === 'standard' && standardCoachStatus !== null && (() => {
+            if (standardCoachStatus === 'none') {
+              return (
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={() => (router as any).push('/find-coach')}
+                  style={{ backgroundColor: colors.card, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, padding: spacing.md, flexDirection: 'row', alignItems: 'center', gap: spacing.md }}
+                >
+                  <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: colors.accent + '15', alignItems: 'center', justifyContent: 'center', borderWidth: 1.5, borderColor: colors.accent + '30' }}>
+                    <Ionicons name="person-add-outline" size={20} color={colors.accent} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: colors.text, fontSize: 14, fontWeight: '800' }}>Trouver un coach</Text>
+                    <Text style={{ color: colors.textSecondary, fontSize: 12, marginTop: 2, lineHeight: 17 }}>Entre en contact avec un coach pour un suivi personnalisé</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={16} color={colors.textSecondary} />
+                </TouchableOpacity>
+              );
+            }
+            if (standardCoachStatus === 'pending') {
+              return (
+                <View style={{ backgroundColor: colors.card, borderRadius: radius.md, borderWidth: 1, borderColor: colors.accent + '44', padding: spacing.md, gap: 10 }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                    <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: colors.accent + '15', alignItems: 'center', justifyContent: 'center' }}>
+                      <Ionicons name="hourglass-outline" size={20} color={colors.accent} />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ color: colors.text, fontSize: 14, fontWeight: '800' }}>Demande de coaching envoyée</Text>
+                      <Text style={{ color: colors.textSecondary, fontSize: 12, marginTop: 2 }}>
+                        {standardCoachName ? `En attente de ${standardCoachName}` : 'En attente d\'acceptation'}
+                      </Text>
+                    </View>
+                    <View style={{ backgroundColor: colors.accent + '20', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 }}>
+                      <Text style={{ color: colors.accent, fontSize: 10, fontWeight: '800' }}>EN COURS</Text>
+                    </View>
+                  </View>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingTop: 2 }}>
+                    {[
+                      'Le coach examine ta demande',
+                      'Tu recevras une notification',
+                    ].map((tip, i) => (
+                      <View key={i} style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+                        <View style={{ width: 5, height: 5, borderRadius: 3, backgroundColor: colors.accent + '66' }} />
+                        <Text style={{ color: colors.textSecondary, fontSize: 11, flex: 1 }}>{tip}</Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+              );
+            }
+            return null;
+          })()}
+
+          {/* Poids + Steps */}
+          <View style={styles.row}>
+            <View style={[styles.card, { flex: 1, alignItems: 'center' }]}>
+              <Text style={styles.cardTitle}>Pas aujourd'hui</Text>
+              <CircularProgress
+                progress={stepProgress}
+                size={110}
+                strokeWidth={10}
+                color={stepProgress >= 1 ? colors.accentGreen : colors.accent}
+                label={steps.toLocaleString()}
+                sublabel={`/ ${activeProfile.stepGoal.toLocaleString()}`}
+              />
+              <Text style={styles.cardSub}>{Math.round(stepProgress * 100)}%</Text>
+            </View>
+
+            <View style={[styles.card, { flex: 1, alignItems: 'center', justifyContent: 'center' }]}>
+              <Text style={styles.cardTitle}>Poids</Text>
+              {displayWeight ? (
+                <>
+                  <Text style={styles.weightValue}>{displayWeight.weight.toFixed(1)}</Text>
+                  <Text style={styles.weightUnit}>kg</Text>
+                  <Button
+                    label="Modifier"
+                    variant="secondary"
+                    size="sm"
+                    style={{ marginTop: 8, alignSelf: 'center' }}
+                    onPress={() => { setEditWeightInput(String(displayWeight.weight)); setShowWeightEdit(true); }}
+                  />
+                </>
+              ) : (
+                <Text style={styles.noData}>–</Text>
+              )}
+            </View>
+          </View>
+
+          {/* Planning coach ou Training du jour */}
+          {accountType === 'coach' ? (() => {
+            const DAY_LABELS_SHORT = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'];
+            const DAY_LABELS_FULL = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche'];
+            const dayItems = coachSchedule.filter((i) => i.dayOfWeek === selectedDayIdx)
+              .sort((a, b) => a.time.localeCompare(b.time));
+
+            return (
+              <View style={[styles.trainingCard, { gap: 0 }]}>
+
+                {/* Header */}
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <DumbbellIcon size={20} />
+                    <Text style={styles.trainingTitle}>Planning coaching</Text>
+                  </View>
+                  <Button label="+ Ajouter" variant="primary" size="sm" fullWidth={false} onPress={() => { setManualDay(selectedDayIdx); setShowManualModal(true); }} />
+                </View>
+
+                {/* Nav jours */}
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
+                  <View style={{ flexDirection: 'row', gap: 6 }}>
+                    {DAY_LABELS_SHORT.map((d, idx) => {
+                      const count = coachSchedule.filter((i) => i.dayOfWeek === idx).length;
+                      const isToday = idx === todayIdx;
+                      const isSelected = idx === selectedDayIdx;
+                      return (
+                        <TouchableOpacity key={d} onPress={() => setSelectedDayIdx(idx)} style={{ alignItems: 'center', gap: 4 }}>
+                          <View style={{
+                            backgroundColor: isSelected ? colors.accent : colors.surface,
+                            borderRadius: radius.sm,
+                            paddingHorizontal: 12, paddingVertical: 7,
+                            borderWidth: isToday && !isSelected ? 1 : 0,
+                            borderColor: colors.accent,
+                          }}>
+                            <Text style={{ color: isSelected ? '#fff' : isToday ? colors.accent : colors.textSecondary, fontSize: 12, fontWeight: '700' }}>{d}</Text>
+                          </View>
+                          {count > 0 && <View style={{ width: 5, height: 5, borderRadius: 3, backgroundColor: isSelected ? colors.accent : colors.textSecondary }} />}
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                </ScrollView>
+
+                {/* Titre jour sélectionné */}
+                <Text style={{ color: colors.textSecondary, fontSize: 12, fontWeight: '700', marginBottom: 8 }}>
+                  {DAY_LABELS_FULL[selectedDayIdx].toUpperCase()}{selectedDayIdx === todayIdx ? " — AUJOURD'HUI" : ""}
+                </Text>
+
+                {/* Séances du jour */}
+                {dayItems.length === 0 ? (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8 }}>
+                    <BedIcon size={18} />
+                    <Text style={styles.restText}>Aucune séance ce jour</Text>
+                  </View>
+                ) : (
+                  dayItems.map((item) => {
+                    const isLinked = !!item.studentUid;
+                    return (
+                      <TouchableOpacity key={item.id} activeOpacity={0.75} onPress={() => setSessionDetail(item)} style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: colors.bg, borderRadius: radius.sm, padding: 14, marginBottom: 8, borderLeftWidth: 3, borderLeftColor: isLinked ? colors.accent : colors.textSecondary, gap: 10 }}>
+                        {/* Heure */}
+                        <View style={{ alignItems: 'center', minWidth: 42 }}>
+                          <Text style={{ color: colors.accent, fontSize: 15, fontWeight: '800' }}>{item.time}</Text>
+                        </View>
+                        {/* Infos */}
+                        <View style={{ flex: 1 }}>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                            <Text style={{ color: colors.text, fontSize: 14, fontWeight: '700' }}>{item.studentPseudo}</Text>
+                            {isLinked && (
+                              <View style={{ backgroundColor: colors.accent, borderRadius: 4, paddingHorizontal: 5, paddingVertical: 1 }}>
+                                <Text style={{ color: '#fff', fontSize: 9, fontWeight: '800', letterSpacing: 0.3 }}>APP</Text>
+                              </View>
+                            )}
+                          </View>
+                          {item.sessionName ? <Text style={{ color: colors.textSecondary, fontSize: 12, marginTop: 2 }}>{item.sessionName}</Text> : null}
+                          {item.location ? <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 2 }}><Ionicons name="location-outline" size={11} color={colors.textSecondary} /><Text style={{ color: colors.textSecondary, fontSize: 11 }}>{item.location}</Text></View> : null}
+                          {!isLinked && !item.location && <Text style={{ color: colors.textSecondary, fontSize: 11, marginTop: 2 }}>Créneau manuel</Text>}
+                        </View>
+                        {/* Modifier / Supprimer */}
+                        {item.isManual && (
+                          <View style={{ flexDirection: 'row', gap: 6 }}>
+                            <TouchableOpacity style={{ paddingHorizontal: 12, paddingVertical: 6, backgroundColor: colors.surface, borderRadius: 6, borderWidth: 1, borderColor: colors.border }} onPress={() => {
+                              setEditingManualId(item.id);
+                              setManualLabel(item.studentPseudo);
+                              setManualTime(item.time);
+                              setManualDay(item.dayOfWeek);
+                              setManualLocation(item.location ?? '');
+                              const linked = item.studentUid ? coachStudentsList.find((s) => s.uid === item.studentUid) : null;
+                              setManualStudentUid(item.studentUid ?? null);
+                              setStudentSearch(linked?.pseudo ?? '');
+                              setTempTime(item.time);
+                              setShowTimePicker(false);
+                              setShowManualModal(true);
+                            }}>
+                              <Ionicons name="pencil" size={14} color={colors.text} />
+                            </TouchableOpacity>
+                            <TouchableOpacity style={{ paddingHorizontal: 12, paddingVertical: 6, backgroundColor: colors.danger + '22', borderRadius: 6, borderWidth: 1, borderColor: colors.danger }} onPress={() => {
+                              Alert.alert('Supprimer', `Supprimer "${item.studentPseudo}" ?`, [
+                                { text: 'Annuler', style: 'cancel' },
+                                { text: 'Supprimer', style: 'destructive', onPress: async () => {
+                                  const uid = auth.currentUser?.uid;
+                                  if (!uid) return;
+                                  const { deleteManualCoachSession, loadCoachWeekSchedule } = await import('../../utils/coachStorage');
+                                  await deleteManualCoachSession(uid, item.id);
+                                  const updated = await loadCoachWeekSchedule(uid);
+                                  setCoachSchedule(updated);
+                                }},
+                              ]);
+                            }}>
+                              <Ionicons name="close" size={14} color={colors.danger} />
+                            </TouchableOpacity>
+                          </View>
+                        )}
+                      </TouchableOpacity>
+                    );
+                  })
+                )}
+
+                {/* Modal résumé séance */}
+                <Modal visible={!!sessionDetail} transparent animationType="fade" onRequestClose={() => setSessionDetail(null)}>
+                  <View style={{ flex: 1, backgroundColor: '#00000080', justifyContent: 'center', alignItems: 'center', padding: spacing.lg }}>
+                    <View style={{ backgroundColor: colors.card, borderRadius: radius.xl, width: '100%', overflow: 'hidden' }}>
+                      {sessionDetail && (() => {
+                        const linked = sessionDetail.studentUid ? coachStudentsList.find((s) => s.uid === sessionDetail.studentUid) : null;
+                        const DAY_LABELS_FULL_LOCAL = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche'];
+                        return (
+                          <>
+                            {/* Header coloré */}
+                            <View style={{ backgroundColor: linked ? colors.accent : colors.surface, padding: spacing.lg, paddingBottom: spacing.md }}>
+                              <Text style={{ color: linked ? '#fff' : colors.text, fontSize: 20, fontWeight: '800' }}>{sessionDetail.studentPseudo}</Text>
+                              <Text style={{ color: linked ? '#ffffff99' : colors.textSecondary, fontSize: 13, marginTop: 2 }}>
+                                {DAY_LABELS_FULL_LOCAL[sessionDetail.dayOfWeek]} · {sessionDetail.time}
+                              </Text>
+                            </View>
+
+                            {/* Infos */}
+                            <View style={{ padding: spacing.lg, gap: spacing.md }}>
+
+                              {/* Élève app */}
+                              {linked && (
+                                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                                  {linked.photoUrl?.startsWith('http') ? (
+                                    <ExpoImage source={{ uri: linked.photoUrl }} style={{ width: 40, height: 40, borderRadius: 20 }} contentFit="cover" />
+                                  ) : (
+                                    <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.surface, alignItems: 'center', justifyContent: 'center' }}>
+                                      <Text style={{ color: colors.accent, fontWeight: '800', fontSize: 16 }}>{linked.pseudo[0]?.toUpperCase()}</Text>
+                                    </View>
+                                  )}
+                                  <View>
+                                    <Text style={{ color: colors.textSecondary, fontSize: 11, fontWeight: '700', textTransform: 'uppercase' as const }}>Élève app</Text>
+                                    <Text style={{ color: colors.text, fontWeight: '700', fontSize: 15 }}>@{linked.pseudo}</Text>
+                                  </View>
+                                  <View style={{ marginLeft: 'auto' as any, backgroundColor: colors.accent + '22', borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1, borderColor: colors.accent }}>
+                                    <Text style={{ color: colors.accent, fontSize: 10, fontWeight: '800' }}>APP</Text>
+                                  </View>
+                                </View>
+                              )}
+
+                              {/* Nom séance */}
+                              {sessionDetail.sessionName ? (
+                                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                                  <Ionicons name="barbell-outline" size={20} color={colors.accent} />
+                                  <View>
+                                    <Text style={{ color: colors.textSecondary, fontSize: 11, fontWeight: '700', textTransform: 'uppercase' as const }}>Séance</Text>
+                                    <Text style={{ color: colors.text, fontWeight: '600', fontSize: 15 }}>{sessionDetail.sessionName}</Text>
+                                  </View>
+                                </View>
+                              ) : null}
+
+                              {/* Lieu */}
+                              {sessionDetail.location ? (
+                                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                                  <Ionicons name="location-outline" size={20} color={colors.accent} />
+                                  <View>
+                                    <Text style={{ color: colors.textSecondary, fontSize: 11, fontWeight: '700', textTransform: 'uppercase' as const }}>Lieu</Text>
+                                    <Text style={{ color: colors.text, fontWeight: '600', fontSize: 15 }}>{sessionDetail.location}</Text>
+                                  </View>
+                                </View>
+                              ) : null}
+
+                              {/* Heure */}
+                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                                <Ionicons name="time-outline" size={20} color={colors.accent} />
+                                <View>
+                                  <Text style={{ color: colors.textSecondary, fontSize: 11, fontWeight: '700', textTransform: 'uppercase' as const }}>Heure</Text>
+                                  <Text style={{ color: colors.text, fontWeight: '600', fontSize: 15 }}>{sessionDetail.time}</Text>
+                                </View>
+                              </View>
+                            </View>
+
+                            {/* Boutons */}
+                            <View style={{ flexDirection: 'row', gap: 10, padding: spacing.md, paddingTop: 0 }}>
+                              <Button label="Modifier" variant="secondary" style={{ flex: 1 }} onPress={() => {
+                                setSessionDetail(null);
+                                setEditingManualId(sessionDetail.id);
+                                setManualLabel(sessionDetail.studentPseudo);
+                                setManualTime(sessionDetail.time);
+                                setManualDay(sessionDetail.dayOfWeek);
+                                setManualLocation(sessionDetail.location ?? '');
+                                const lnk = sessionDetail.studentUid ? coachStudentsList.find((s) => s.uid === sessionDetail.studentUid) : null;
+                                setManualStudentUid(sessionDetail.studentUid ?? null);
+                                setStudentSearch(lnk?.pseudo ?? '');
+                                setTempTime(sessionDetail.time);
+                                setShowManualModal(true);
+                              }} />
+                              <Button label="Fermer" variant="ghost" style={{ flex: 1 }} onPress={() => setSessionDetail(null)} />
+                            </View>
+                          </>
+                        );
+                      })()}
+                    </View>
+                  </View>
+                </Modal>
+
+                {/* Modal ajout créneau */}
+                <Modal visible={showManualModal} transparent animationType="slide" onRequestClose={() => { setShowManualModal(false); setShowTimePicker(false); setEditingManualId(null); }}>
+                  <View style={{ flex: 1, backgroundColor: '#000000CC', justifyContent: 'flex-end' }}>
+                    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ maxHeight: '92%' }}>
+                      <ScrollView
+                        style={{ backgroundColor: colors.card, borderTopLeftRadius: radius.xl, borderTopRightRadius: radius.xl }}
+                        contentContainerStyle={{ padding: spacing.lg, gap: spacing.md }}
+                        keyboardShouldPersistTaps="handled"
+                        showsVerticalScrollIndicator={false}
+                        bounces={false}
+                      >
+                        <Text style={{ color: colors.text, fontSize: 18, fontWeight: '800' }}>{editingManualId ? 'Modifier le créneau' : 'Nouveau créneau'}</Text>
+
+                        {/* Recherche élève app */}
+                        {coachStudentsList.length > 0 && (
+                          <View>
+                            <Text style={{ color: colors.textSecondary, fontSize: 11, fontWeight: '700', marginBottom: 6, textTransform: 'uppercase' as const, letterSpacing: 0.5 }}>Associer un élève</Text>
+
+                            {/* Élève sélectionné */}
+                            {manualStudentUid ? (() => {
+                              const sel = coachStudentsList.find((s) => s.uid === manualStudentUid);
+                              return (
+                                <View style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: colors.accent + '18', borderRadius: radius.sm, borderWidth: 1.5, borderColor: colors.accent, padding: 10, gap: 10 }}>
+                                  {sel?.photoUrl?.startsWith('http') ? (
+                                    <ExpoImage source={{ uri: sel.photoUrl }} style={{ width: 36, height: 36, borderRadius: 18 }} contentFit="cover" />
+                                  ) : (
+                                    <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: colors.surface, alignItems: 'center', justifyContent: 'center' }}>
+                                      <Text style={{ color: colors.accent, fontWeight: '800', fontSize: 15 }}>{sel?.pseudo?.[0]?.toUpperCase() ?? '?'}</Text>
+                                    </View>
+                                  )}
+                                  <Text style={{ flex: 1, color: colors.text, fontWeight: '700', fontSize: 14 }}>@{sel?.pseudo}</Text>
+                                  <TouchableOpacity onPress={() => { setManualStudentUid(null); setStudentSearch(''); setManualLabel(''); }}>
+                                    <Ionicons name="close" size={20} color={colors.textSecondary} />
+                                  </TouchableOpacity>
+                                </View>
+                              );
+                            })() : (
+                              <>
+                                <TextInput
+                                  style={{ backgroundColor: colors.surface, borderRadius: radius.sm, padding: 14, color: colors.text, borderWidth: 1, borderColor: colors.border, fontSize: 15 }}
+                                  placeholder="Rechercher par pseudo…"
+                                  placeholderTextColor={colors.textSecondary}
+                                  value={studentSearch}
+                                  onChangeText={(v) => setStudentSearch(v)}
+                                />
+                                {studentSearch.length > 0 && (() => {
+                                  const matches = coachStudentsList.filter((s) =>
+                                    s.pseudo.toLowerCase().includes(studentSearch.toLowerCase())
+                                  );
+                                  if (matches.length === 0) return (
+                                    <Text style={{ color: colors.textSecondary, fontSize: 13, marginTop: 6, paddingHorizontal: 4 }}>Aucun élève trouvé</Text>
+                                  );
+                                  return (
+                                    <View style={{ backgroundColor: colors.surface, borderRadius: radius.sm, borderWidth: 1, borderColor: colors.border, marginTop: 4, overflow: 'hidden' }}>
+                                      {matches.map((s, i) => (
+                                        <TouchableOpacity
+                                          key={s.uid}
+                                          onPress={() => { setManualStudentUid(s.uid); setStudentSearch(s.pseudo); }}
+                                          style={{ flexDirection: 'row', alignItems: 'center', padding: 10, gap: 10, borderTopWidth: i > 0 ? 1 : 0, borderTopColor: colors.border }}
+                                        >
+                                          {s.photoUrl?.startsWith('http') ? (
+                                            <ExpoImage source={{ uri: s.photoUrl }} style={{ width: 32, height: 32, borderRadius: 16 }} contentFit="cover" />
+                                          ) : (
+                                            <View style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' }}>
+                                              <Text style={{ color: colors.accent, fontWeight: '800', fontSize: 13 }}>{s.pseudo[0]?.toUpperCase()}</Text>
+                                            </View>
+                                          )}
+                                          <Text style={{ color: colors.text, fontWeight: '600', fontSize: 14 }}>@{s.pseudo}</Text>
+                                        </TouchableOpacity>
+                                      ))}
+                                    </View>
+                                  );
+                                })()}
+                              </>
+                            )}
+                          </View>
+                        )}
+
+                        {/* Nom / intitulé libre */}
+                        <View>
+                          <Text style={{ color: colors.textSecondary, fontSize: 11, fontWeight: '700', marginBottom: 6, textTransform: 'uppercase' as const, letterSpacing: 0.5 }}>Nom de la séance</Text>
+                          <TextInput
+                            style={{ backgroundColor: colors.surface, borderRadius: radius.sm, padding: 14, color: colors.text, borderWidth: 1, borderColor: colors.border, fontSize: 15 }}
+                            placeholder="Ex: Cours particulier, Full body…"
+                            placeholderTextColor={colors.textSecondary}
+                            value={manualLabel}
+                            onChangeText={setManualLabel}
+                          />
+                        </View>
+
+                        {/* Lieu */}
+                        <TextInput
+                          style={{ backgroundColor: colors.surface, borderRadius: radius.sm, padding: 14, color: colors.text, borderWidth: 1, borderColor: colors.border, fontSize: 15 }}
+                          placeholder="Lieu (salle, adresse…)"
+                          placeholderTextColor={colors.textSecondary}
+                          value={manualLocation}
+                          onChangeText={setManualLocation}
+                        />
+
+                        {/* Sélection jour */}
+                        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                          <View style={{ flexDirection: 'row', gap: 8 }}>
+                            {DAY_LABELS_FULL.map((d, idx) => (
+                              <TouchableOpacity key={d} onPress={() => setManualDay(idx)}
+                                style={{ backgroundColor: manualDay === idx ? colors.accent : colors.surface, borderRadius: radius.sm, paddingHorizontal: 14, paddingVertical: 10 }}>
+                                <Text style={{ color: manualDay === idx ? '#fff' : colors.textSecondary, fontWeight: '700', fontSize: 13 }}>{d}</Text>
+                              </TouchableOpacity>
+                            ))}
+                          </View>
+                        </ScrollView>
+
+                        {/* Heure */}
+                        <TouchableOpacity
+                          style={{ backgroundColor: colors.surface, borderRadius: radius.sm, borderWidth: 1, borderColor: colors.border, padding: 14, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}
+                          onPress={() => { Keyboard.dismiss(); setTempTime(manualTime); setShowTimePicker(true); }}
+                        >
+                          <Text style={{ color: colors.textSecondary, fontSize: 15 }}>Heure du cours</Text>
+                          <Text style={{ color: colors.accent, fontSize: 15, fontWeight: '800' }}>{manualTime}</Text>
+                        </TouchableOpacity>
+
+                        {/* Picker heure — popup modale style iOS */}
+                        <Modal visible={showTimePicker} transparent animationType="fade">
+                          <View style={{ flex: 1, backgroundColor: '#00000080', justifyContent: 'center', alignItems: 'center', padding: spacing.lg }}>
+                            <View style={{ backgroundColor: colors.card, borderRadius: radius.xl, width: '100%', overflow: 'hidden' }}>
+                              <Text style={{ color: colors.text, fontSize: 16, fontWeight: '800', textAlign: 'center', paddingTop: spacing.lg, paddingHorizontal: spacing.lg }}>Choisir l'heure</Text>
+                              {(() => {
+                                const [h, m] = tempTime.split(':').map(Number);
+                                const d = new Date(); d.setHours(h || 9, m || 0, 0, 0);
+                                const DateTimePicker = require('@react-native-community/datetimepicker').default;
+                                return (
+                                  <DateTimePicker
+                                    value={d} mode="time" display="spinner" locale="fr-FR" textColor={colors.text}
+                                    style={{ backgroundColor: colors.card }}
+                                    onChange={(_: any, date?: Date) => {
+                                      if (!date) return;
+                                      const hh = String(date.getHours()).padStart(2, '0');
+                                      const mm = String(date.getMinutes()).padStart(2, '0');
+                                      setTempTime(`${hh}:${mm}`);
+                                    }}
+                                  />
+                                );
+                              })()}
+                              <View style={{ flexDirection: 'row', gap: 10, padding: spacing.md }}>
+                                <Button label="Annuler" variant="ghost" style={{ flex: 1 }} onPress={() => setShowTimePicker(false)} />
+                                <Button label="Confirmer" variant="primary" style={{ flex: 1 }} onPress={() => { setManualTime(tempTime); setShowTimePicker(false); }} />
+                              </View>
+                            </View>
+                          </View>
+                        </Modal>
+
+                        {/* Boutons action */}
+                        <Button
+                          label={editingManualId ? 'Enregistrer les modifications' : 'Ajouter le créneau'}
+                          variant="primary"
+                          size="lg"
+                          loading={savingManual}
+                          disabled={!manualLabel.trim()}
+                          onPress={async () => {
+                            setSavingManual(true);
+                            const uid = auth.currentUser?.uid;
+                            if (uid) {
+                              const { addManualCoachSession, deleteManualCoachSession, loadCoachWeekSchedule } = await import('../../utils/coachStorage');
+                              if (editingManualId) await deleteManualCoachSession(uid, editingManualId);
+                              await addManualCoachSession(uid, {
+                                label: manualLabel.trim(),
+                                time: manualTime,
+                                dayOfWeek: manualDay,
+                                location: manualLocation.trim() || undefined,
+                                studentUid: manualStudentUid ?? undefined,
+                              });
+                              const updated = await loadCoachWeekSchedule(uid);
+                              setCoachSchedule(updated);
+                              setSelectedDayIdx(manualDay);
+                            }
+                            setManualLabel(''); setManualTime('09:00'); setManualDay(todayIdx); setManualLocation('');
+                            setManualStudentUid(null); setStudentSearch(''); setShowTimePicker(false); setEditingManualId(null);
+                            setSavingManual(false);
+                            setShowManualModal(false);
+                          }}
+                        />
+                        <Button label="Annuler" variant="ghost" onPress={() => { setShowManualModal(false); setShowTimePicker(false); setEditingManualId(null); }} />
+                      </ScrollView>
+                    </KeyboardAvoidingView>
+                  </View>
+                </Modal>
+              </View>
+            );
+          })() : (
+          <TouchableOpacity
+            activeOpacity={planUpdated && accountType === 'student' ? 0.85 : 1}
+            onPress={planUpdated && accountType === 'student' ? markPlanUpdatedRead : undefined}
+            style={[styles.trainingCard, planUpdated && accountType === 'student' && { borderWidth: 1.5, borderColor: colors.accent }]}
+          >
+            {/* Badge mise à jour plan coach */}
+            {planUpdated && accountType === 'student' && (
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: colors.accent + '18', borderRadius: radius.sm, paddingHorizontal: 10, paddingVertical: 6, marginBottom: 10, borderWidth: 1, borderColor: colors.accent + '40' }}>
+                <Ionicons name="sparkles" size={13} color={colors.accent} />
+                <Text style={{ color: colors.accent, fontSize: 12, fontWeight: '700', flex: 1 }}>Ton coach a mis à jour ton programme</Text>
+                <Ionicons name="checkmark" size={13} color={colors.accent} />
+              </View>
+            )}
+            {/* Header */}
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                <View style={{ width: 32, height: 32, borderRadius: 10, backgroundColor: colors.accent + '18', alignItems: 'center', justifyContent: 'center' }}>
+                  <Ionicons name="barbell-outline" size={16} color={colors.accent} />
+                </View>
+                <Text style={styles.trainingTitle}>Training du jour</Text>
+              </View>
+              {weekTrainingCount.total > 0 && (
+                <View style={styles.trainingCountBadge}>
+                  <Text style={styles.trainingCountText}>{weekTrainingCount.done}/{weekTrainingCount.total} sem.</Text>
+                </View>
+              )}
+            </View>
+
+            {/* Contenu */}
+            {isRestDay ? (
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: colors.bg, borderRadius: radius.sm, padding: spacing.md, marginTop: 4 }}>
+                <Ionicons name="moon-outline" size={18} color={colors.textSecondary} />
+                <Text style={{ color: colors.textSecondary, fontSize: 14 }}>Journée de récupération</Text>
+              </View>
+            ) : todaySessions.length === 0 ? (
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: colors.bg, borderRadius: radius.sm, padding: spacing.md, marginTop: 4 }}>
+                <Ionicons name="moon-outline" size={18} color={colors.textSecondary} />
+                <Text style={{ color: colors.textSecondary, fontSize: 14 }}>Aucune séance prévue</Text>
+              </View>
+            ) : (
+              <View style={{ gap: 8, marginTop: 4 }}>
+                {todaySessions.map(({ scheduled, session }) => {
+                  const muscles = [...new Set(session!.exercises.map((e) => MUSCLE_LABELS[e.muscle]))];
+                  const done = scheduled.completed;
+                  return (
+                    <TouchableOpacity
+                      key={scheduled.id}
+                      style={{ backgroundColor: colors.bg, borderRadius: radius.sm, padding: spacing.md, flexDirection: 'row', alignItems: 'center', gap: spacing.sm, borderLeftWidth: 3, borderLeftColor: done ? colors.accentGreen : colors.accent, opacity: done ? 0.7 : 1 }}
+                      onPress={() => setDetailSession({ session: session!, time: scheduled.time })}
+                      activeOpacity={0.75}
+                    >
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ color: colors.text, fontSize: 14, fontWeight: '700' }}>{session!.name}</Text>
+                        <Text style={{ color: colors.textSecondary, fontSize: 12, marginTop: 2 }}>{muscles.join(' · ')}</Text>
+                      </View>
+                      <View style={{ alignItems: 'center', gap: 2 }}>
+                        <Ionicons name={done ? 'checkmark-circle' : 'chevron-forward'} size={18} color={done ? colors.accentGreen : colors.textSecondary} />
+                        <Text style={{ color: done ? colors.accentGreen : colors.textSecondary, fontSize: 10, fontWeight: '600' }}>{done ? 'Fait' : 'Détails'}</Text>
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            )}
+          </TouchableOpacity>
+          )}
+
+          {/* Saisie poids */}
+          <View style={[styles.weightInputCard, !!todayEntry && styles.weightInputCardDone]}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              {todayEntry
+                ? <CheckIcon size={15} color={colors.textSecondary} />
+                : <ScaleIcon size={15} color={colors.accent} />}
+              <Text style={[styles.weightInputTitle, !!todayEntry && { color: colors.textSecondary }]}>
+                {todayEntry ? 'Poids enregistré aujourd\'hui' : 'Saisir mon poids du jour'}
+              </Text>
+            </View>
+            <View style={styles.weightInputRow}>
+              <TextInput
+                style={[styles.weightInput, !!todayEntry && styles.weightInputDisabled]}
+                placeholder="ex: 75.4"
+                placeholderTextColor={colors.textSecondary}
+                value={todayEntry ? String(todayEntry.weight) : weightInput}
+                onChangeText={setWeightInput}
+                keyboardType="decimal-pad"
+                editable={!todayEntry}
+              />
+              <Text style={[styles.weightInputUnit, !!todayEntry && { color: colors.textSecondary }]}>kg</Text>
+              <TouchableOpacity
+                style={[styles.weightSaveBtn, (savingWeight || !!todayEntry) && { opacity: 0.4 }]}
+                onPress={saveWeight}
+                disabled={savingWeight || !!todayEntry}
+              >
+                <Text style={styles.weightSaveBtnText}>{todayEntry ? 'Enregistré' : 'Enregistrer'}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {/* Box Club — comptes standard et admin */}
+          {(accountType === 'standard' || accountType === 'admin') && (
+            <View style={{ backgroundColor: colors.card, borderRadius: radius.md, borderWidth: 1, borderColor: colors.border, overflow: 'hidden' }}>
+              {/* Header box */}
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: spacing.md, paddingTop: spacing.md, paddingBottom: 8 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                  <Ionicons name="people" size={18} color={colors.accent} />
+                  <Text style={{ color: colors.text, fontSize: 15, fontWeight: '800' }}>Club à la une</Text>
+                  {clubNotifCount > 0 && (
+                    <View style={{ backgroundColor: colors.accent, borderRadius: 10, minWidth: 20, height: 20, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 5 }}>
+                      <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>{clubNotifCount}</Text>
+                    </View>
+                  )}
+                </View>
+                {!myClubId && (
+                  <TouchableOpacity onPress={() => router.push('/clubs')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                    <Text style={{ color: colors.accent, fontSize: 13, fontWeight: '600' }}>Voir tout</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+
+              {featuredClub ? (
+                <TouchableOpacity onPress={() => router.push('/clubs')} activeOpacity={0.85}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: spacing.md, paddingBottom: spacing.md, gap: 14 }}>
+                    {featuredClub.photoUrl
+                      ? <ExpoImage source={{ uri: featuredClub.photoUrl }} style={{ width: 64, height: 64, borderRadius: 32 }} contentFit="cover" />
+                      : <View style={{ width: 64, height: 64, borderRadius: 32, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' }}>
+                          <Ionicons name="people" size={28} color={colors.accent} />
+                        </View>}
+                    <View style={{ flex: 1, gap: 4 }}>
+                      <Text style={{ color: colors.text, fontSize: 16, fontWeight: '700' }} numberOfLines={1}>{featuredClub.name}</Text>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <View style={{ backgroundColor: colors.accent + '20', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10 }}>
+                          <Text style={{ color: colors.accent, fontSize: 11, fontWeight: '600' }}>{featuredClub.category}</Text>
+                        </View>
+                        <Text style={{ color: colors.textSecondary, fontSize: 12 }}>{(featuredClub.memberIds ?? []).length} membre{(featuredClub.memberIds ?? []).length > 1 ? 's' : ''}</Text>
+                      </View>
+                      <Text style={{ color: colors.textSecondary, fontSize: 13 }} numberOfLines={1}>{featuredClub.description}</Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={18} color={colors.textSecondary} />
+                  </View>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity onPress={() => router.push('/clubs')} activeOpacity={0.85}
+                  style={{ paddingHorizontal: spacing.md, paddingBottom: spacing.md, alignItems: 'center', gap: 8 }}>
+                  <Text style={{ color: colors.textSecondary, fontSize: 14, textAlign: 'center' }}>
+                    Découvre les clubs de la communauté
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
+
+        </ScrollView>
+      </KeyboardAvoidingView>
+
+      <SessionDetailModal
+        session={detailSession?.session ?? null}
+        time={detailSession?.time}
+        onClose={() => setDetailSession(null)}
+      />
+
+      {/* Modal modification poids */}
+      <Modal visible={showWeightEdit} transparent animationType="fade">
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
+          <View style={styles.editModalOverlay}>
+            <View style={styles.editModalCard}>
+              <Text style={styles.editModalTitle}>Modifier le poids du jour</Text>
+              <Text style={styles.editModalSub}>Le changement recalculera tes macros automatiquement.</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm, justifyContent: 'center' }}>
+                <TextInput
+                  style={styles.editModalInput}
+                  value={editWeightInput}
+                  onChangeText={setEditWeightInput}
+                  keyboardType="decimal-pad"
+                  autoFocus
+                  selectTextOnFocus
+                />
+                <Text style={{ color: colors.textSecondary, fontSize: 18 }}>kg</Text>
+              </View>
+              <View style={{ flexDirection: 'row', gap: spacing.sm }}>
+                <Button label="Annuler" variant="ghost" style={{ flex: 1 }} onPress={() => setShowWeightEdit(false)} />
+                <Button label="Enregistrer" variant="primary" style={{ flex: 1 }} onPress={async () => {
+                  const val = parseFloat(editWeightInput.replace(',', '.'));
+                  if (!state || !activeProfile || isNaN(val) || val < 20 || val > 300) {
+                    Alert.alert('Valeur invalide'); return;
+                  }
+                  const filteredHistory = activeProfile.weightHistory.filter((e) => e.date !== todayStr);
+                  const newHistory = [...filteredHistory, { date: todayStr, weight: val }]
+                    .sort((a, b) => a.date.localeCompare(b.date));
+                  const next = {
+                    ...state,
+                    profiles: state.profiles.map((p) =>
+                      p.id === activeProfile.id ? { ...p, weight: val, weightHistory: newHistory } : p
+                    ),
+                  };
+                  await saveState(next);
+                  setState(next);
+                  setShowWeightEdit(false);
+                }} />
+              </View>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+

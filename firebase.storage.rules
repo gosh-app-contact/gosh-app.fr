@@ -1,0 +1,46 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Avatars : lecture pour tous les authentifiés, écriture/suppression uniquement sur son propre dossier
+    match /avatars/{uid}/{filename} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null && request.auth.uid == uid
+                   && request.resource.size < 5 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Posts : lecture pour tous les authentifiés, écriture/suppression uniquement sur son propre dossier
+    match /posts/{uid}/{filename} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null && request.auth.uid == uid
+                   && request.resource.size < 10 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Photos de clubs : lecture pour tous les authentifiés, écriture par les membres
+    match /clubs/{filename} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+                   && request.resource.size < 5 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+      allow delete: if request.auth != null;
+    }
+
+    // Photos du chat de club
+    match /club-chat/{filename} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+                   && request.resource.size < 10 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+      allow delete: if request.auth != null;
+    }
+
+    // Tout le reste : interdit
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
