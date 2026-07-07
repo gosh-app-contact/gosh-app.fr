@@ -22,25 +22,19 @@
       padding: 48px 24px 36px;
     }
 
-    /* ─── FOND VIDÉO ─────────────────────────────────── */
-    .bg-video {
+    /* ─── FOND GIF ──────────────────────────────────── */
+    .bg-gif {
       position: fixed;
       top: 0; left: 0;
       width: 100vw;
       height: 100vh;
       z-index: -1;
-      pointer-events: none;
-      overflow: hidden;
-    }
-
-    .bg-video video {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
+      background: url('assets/animation/fond-site-gosh.GIF') center center / cover no-repeat;
       opacity: 0.18;
+      pointer-events: none;
     }
 
-    .bg-video::after {
+    .bg-gif::after {
       content: '';
       position: absolute;
       inset: 0;
@@ -207,10 +201,8 @@
 </head>
 <body>
 
-  <!-- Fond vidéo -->
-  <div class="bg-video">
-    <video src="assets/animation/fond-site gosh.mp4" autoplay muted loop playsinline></video>
-  </div>
+  <!-- Fond GIF -->
+  <div class="bg-gif"></div>
 
   <!-- Hero -->
   <section class="hero">
